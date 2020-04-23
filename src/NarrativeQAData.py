@@ -34,8 +34,9 @@ def ask_doc_qs(docdf, model, qs):
         prediction = cdqa_pipeline.predict(q)
         print('question: {}'.format(q))
         print('predicted answer: {}'.format(prediction[0]))
-        #print('title: {}'.format(prediction[1]))
-        #print('paragraph: {}'.format(prediction[2]))
+        print('title: {}'.format(prediction[1]))
+        print('paragraph: {}'.format(prediction[2]))
+        print("\n\n")
         
 
 
@@ -51,8 +52,9 @@ def pred(qdf, storiesDir, model):
         docFile = os.path.join(storiesDir, docId + ".content")
         qList = docEntries["question"].tolist()
         with open(docFile, "r") as doc:
-            pars = doc.read()
-            docdf = pd.DataFrame({'title' : [docId], "paragraphs" : [[pars]]})
+            data = doc.read()
+            pars = data.split("\n\n\n")
+            docdf = pd.DataFrame({'title' : [docId], "paragraphs" : [pars]})
             ask_doc_qs(docdf, model, qList)
         
 
