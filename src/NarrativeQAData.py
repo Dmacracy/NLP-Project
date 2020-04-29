@@ -1,24 +1,24 @@
 import os
 import sys
 import pandas as pd
+import numpy as np
+import scipy.sparse as sp
 from ast import literal_eval
 
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+
 import argparse
 import code
 import prettytable
 import logging
+import transformers
 
-from termcolor import colored
-from drqa import pipeline
-from drqa.retriever import utils
-import drqa.tokenizers
+from gutenberg.cleanup import strip_headers
 
-from cdqa.utils.converters import pdf_converter
-from cdqa.utils.filters import filter_paragraphs
-from cdqa.pipeline import QAPipeline
-from cdqa.utils.download import download_model
-from cdqa.reader import BertProcessor, BertQA
+
 
 def split_train_test_val(qcsv):
     '''
@@ -31,45 +31,104 @@ def split_train_test_val(qcsv):
     qsTest = qs.loc[qs['set'] == 'test']
     return qsTrain, qsVal, qsTest
 
-
-def ask_doc_qs_cdqa(docdf, cdqa_pipeline, qs):
+class B25mScorer:
     '''
-    Given docdf, a pandas dataframe representing a document 
-    or group of documents with columns 'title' and 'paragraphs', 
-    a joblib model, and a list of questions, this function
-    makes cdqa queries for each question and prints the predicted 
-    answers.
+    A B25m document retreival scorer.
+    See https://en.wikipedia.org/wiki/Okapi_BM25
     '''
-    cdqa_pipeline.fit_retriever(df=docdf)
-    for q in qs:
-        prediction = cdqa_pipeline.predict(q)
-        print('question: {}'.format(q))
-        print('predicted answer: {}'.format(prediction[0]))
-        #print('title: {}'.format(prediction[1]))
-        #print('paragraph: {}'.format(prediction[2]))
-        print("\n\n")
-        
-        
+    def __init__(self, docs, k=1.6, b=0.75):
+        self.N = len(docs) # num docs
+        self.Ds = np.array([len(d) for d in docs]) # length of each doc
+        self.avgD = np.mean(self.Ds) # avg doc length
+        self.docs = [tokenizer.tokenize(doc) for doc in docs] # tokenized docs
+        self.k = k # k and b params.
+        self.b = b
 
-def pred(qdf, storiesDir, model):
+    def score(self, q):
+        # for a given query, return a list of scores for each doc
+        scores = []
+        q_tokenized = tokenizer.tokenize(q)
+        for idx, doc in enumerate(self.docs):   
+            score = 0
+            for q_tok in q_tokenized:
+                # number of docs containing q token:
+                n_q = np.sum([int(q_tok in d) for d in self.docs])
+                # inverse doc freq for q word in this doc:
+                idf = np.log((self.N - n_q + 0.5) / (n_q + 0.5))
+                # term freq:
+                tf = doc.count(q_tok) / self.Ds[idx]
+                numerator = tf * (self.k + 1)
+                denominator = tf + self.k * (1 - self.b + (self.b * self.Ds[idx] /  self.avgD))
+                # sum the doc's score over all query tokens
+                score += idf * (numerator / denominator)
+            # add doc's score to list:
+            scores.append(score)
+        return np.array(scores)
+    
+    def get_best_n_doc_idxs(self, q, n):
+        # return the document indices of the highest n scoring docs for a given 
+        scores = self.score(q)
+        best_n_idxs = np.argsort(-scores)[:n]
+        print(best_n_idxs)
+        return best_n_idxs
+    
+
+def answer_question(question, textids, texts):
+    answers = []
+    for textid in textids:
+        text = texts[textid]
+        print("Question:\n", question)
+        print("Text:\n", text)
+        inputs = tokenizer.encode_plus(question, text, return_tensors="pt")
+        # Need to pop token type ids when using distilbert because this model does not 
+        # handle them, but the encoder still sets them for some reason. 
+        inputs.pop('token_type_ids', None)
+        input_ids = inputs["input_ids"].tolist()[0]
+    
+        text_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        answer_start_scores, answer_end_scores = model(**inputs)
+    
+        # Get the most likely beginning of answer with the argmax of the score
+        answer_start = torch.argmax(answer_start_scores)
+        # Get the most likely end of answer with the argmax of the score
+        answer_end = torch.argmax(answer_end_scores) + 1  
+
+        answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids[answer_start:answer_end]))
+        
+        if "answer" == '[CLS]':
+            print(f"Answer: I cannot answer that.\n")
+        else:
+            print(f"Answer: {answer}\n")
+        answers.append(answer)
+    return answers
+
+    
+def pred(qdf, storiesDir, model, predOutDir, num_best_pars=1):
     '''
     Given a narrativeqa dataframe, a directory where the narrative 
-    stories are located, and a joblib model, this function asks the questions 
-    corresponding to each document using the ask_doc_qs function above. 
+    stories are located, and a pytorch model, this function asks the questions 
+    corresponding to each document. 
     '''
+    tokenizer = AutoTokenizer.from_pretrained(modelPath)
+    model = AutoModelForQuestionAnswering.from_pretrained(modelPath)
+    
     docIds = qdf['document_id'].unique()
-    cdqa_pipeline = QAPipeline(reader=model, min_df=1, max_df=5.0)
-    for docId in docIds[:1]:
+    for docId in docIds:
         docEntries = qdf.loc[qdf['document_id'] == docId]
         docFile = os.path.join(storiesDir, docId + ".content")
-        qList = docEntries["question"].tolist()
         with open(docFile, "r") as doc:
-            data = doc.read()
-            pars = data.split("\n\n\n")
-            docdf = pd.DataFrame({'title' : [docId], "paragraphs" : [pars]})
-            ask_doc_qs_cdqa(docdf, cdqa_pipeline, qList)
-            #for q in qList:
-            #    Drqa_process(q)
+            try:
+                data = doc.read()
+                if '<html>' not in data:
+                    data = strip_headers(data)
+                    pars = data.split("\n\n")
+                    BMScorer = B25mScorer(pars)
+                    docEntries["best_ranked_pars"] = docEntries["question"].apply(lambda q : BMScorer.get_best_n_doc_idxs(q, num_best_pars))
+                    docEntries['predicted_answers'] = docEntries[["question", "best_ranked_pars"]].apply(lambda x : answer_question(*x, pars), axis=1)
+
+                    docEntries.to_csv(os.path.join(predOutDir, docId + '.csv'), index=False)
+            except UnicodeDecodeError:
+                pass
 
 
 def narrative_df_to_squadlike_txt(df, outName):
@@ -82,63 +141,26 @@ def narrative_df_to_squadlike_txt(df, outName):
     with open(outName, 'w') as outfile:
         outfile.write(Json)
 
-def train_cdqa_reader(squadlikeJson, outModel, inModel=None, negatives=False):
-    '''Train a cdqa model on a dataset formatted like squad jsons'''
-
-    # Currently this causes GPU memory errors if run
-    # When running on the CPU it is much too slow ~73 hrs for SQuAD 2.0
-    # Looking into ways to fix it. 
-    
-    # Fine tune an existing model:
-    if inModel:
-        cdqa_pipeline = QAPipeline(reader=inModel)
-        cdqa_pipeline.fit_reader(squadlikeJson)
-    # train a model from scratch:
-    else:
-        train_processor = BertProcessor(do_lower_case=True, is_training=True, version_2_with_negative=negatives)
-        train_examples, train_features = train_processor.fit_transform(X=squadlikeJson)
-        reader = BertQA(train_batch_size=1,
-                        learning_rate=3e-5,
-                        num_train_epochs=2,
-                        do_lower_case=True,
-                        output_dir=os.path.dirname(outModel))
-
-        reader.fit(X=(train_examples, train_features))
-        reader.model.to('cpu')
-        reader.device = torch.device('cpu')
-    # Output model:
-    joblib.dump(reader, os.path.join(reader.output_dir, outModel))
-
-def narrative_df_to_squadlike_json(df, outName):
-    ''' 
-    Convert narrativeQA data to squadlike json format. Left blank for now because it is unclear how to 
-    handle the paragraph-question correspondence for the moment. 
-    '''
-    pass
-    
-        
-
 if __name__ == "__main__":
     # Define file and directory paths:
-    qcsv = './data/narrativeqa/qaps.csv'
-    storiesDir = './data/narrativeqa/stories'
-    inModel = './models/bert_qa.joblib'
+    qcsv = '../data/narrativeqa/qaps.csv'
+    storiesDir = '../data/narrativeqa/stories'
+    modelPath = "../models/SQuAD2_trained_model"
+
+    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased-distilled-squad")
+    model = AutoModelForQuestionAnswering.from_pretrained(modelPath)
+    
     # Split data into three sets:
     qsTrain, qsVal, qsTest = split_train_test_val(qcsv)
 
-    # Train a cdqa model on squad 2:
-    SquadTrainJson = './data/SQuAD/SQuAD-v2.0-train.json'
-    outModel = './models/bert_qa_squad_1_and_2.joblib'
-    #train_cdqa_reader(SquadTrainJson, outModel, negatives=True)
 
-    # Convert narrativeqa data into the squad-like txts for DrQA eval:
+    # Convert narrativeqa data into the squad-like txts for eval:
     #narrative_df_to_squadlike_txt(qsTrain, './data/narrativeqa/train.txt')
     #narrative_df_to_squadlike_txt(qsVal, './data/narrativeqa/val.txt')
     #narrative_df_to_squadlike_txt(qsTest, './data/narrativeqa/test.txt')
 
-    # Run cdqa predicitons on narrativeqa training data:
-    # This can probably easily be repurposed to train the
-    # cdqa retriever (but probably not the reader). 
-    pred(qsTrain, storiesDir, inModel)
+
+    predOutDir = '../data/predictions/'
+    pred(qsTrain, storiesDir, modelPath, predOutDir, 4)
 
 
