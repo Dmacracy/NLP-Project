@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
@@ -69,41 +70,75 @@ class B25mScorer:
         # return the document indices of the highest n scoring docs for a given 
         scores = self.score(q)
         best_n_idxs = np.argsort(-scores)[:n]
-        print(best_n_idxs)
         return best_n_idxs
-    
 
-def answer_question(question, textids, texts):
+def big_text_splitter(text, breakval):
+    '''
+    split longer texts into 'breakval'
+    word length chunks and return as a list.
+    '''
+    split_text = text.split()
+    split_breaks = list(range(0, len(split_text), breakval))
+    texts_split = []
+    for idx, split_break in enumerate(split_breaks[:-1]):
+        end_break = split_break + breakval
+        texts_split.append(" ".join(split_text[split_break:end_break]))
+    texts_split.append(" ".join(split_text[split_breaks[-1]:]))
+    return texts_split
+
+def answer_question(question, textids, texts, breakval=200):
     answers = []
     for textid in textids:
         text = texts[textid]
-        print("Question:\n", question)
-        print("Text:\n", text)
-        inputs = tokenizer.encode_plus(question, text, return_tensors="pt")
-        # Need to pop token type ids when using distilbert because this model does not 
-        # handle them, but the encoder still sets them for some reason. 
-        inputs.pop('token_type_ids', None)
-        input_ids = inputs["input_ids"].tolist()[0]
+        #print("Question:\n", question)
+        #print("Text:\n", text)
+        if len(text.split()) > breakval:
+            split_texts = big_text_splitter(text, breakval)
+            for text in split_texts:
+                inputs = tokenizer.encode_plus(question, text, return_tensors="pt")
+                # Need to pop token type ids when using distilbert because this model does not 
+                # handle them, but the encoder still sets them for some reason. 
+                inputs.pop('token_type_ids', None)
+                input_ids = inputs["input_ids"].tolist()[0]
     
-        text_tokens = tokenizer.convert_ids_to_tokens(input_ids)
-        answer_start_scores, answer_end_scores = model(**inputs)
+                text_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+                answer_start_scores, answer_end_scores = model(**inputs)
     
-        # Get the most likely beginning of answer with the argmax of the score
-        answer_start = torch.argmax(answer_start_scores)
-        # Get the most likely end of answer with the argmax of the score
-        answer_end = torch.argmax(answer_end_scores) + 1  
+                # Get the most likely beginning of answer with the argmax of the score
+                answer_start = torch.topk(answer_start_scores, 2)[1].to(dtype=torch.long, device="cuda")[0]
+                # Get the most likely end of answer with the argmax of the score
+                answer_end = torch.topk(answer_end_scores, 2)[1].to(dtype=torch.long, device="cuda")[0]
 
-        answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids[answer_start:answer_end]))
+                answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids[answer_start[0]:answer_end[0]+1]))
         
-        if "answer" == '[CLS]':
-            print(f"Answer: I cannot answer that.\n")
+                if answer == '[CLS]':
+                    answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids[answer_start[1]:answer_end[1]+1]))
+                answers.append(answer.replace('[CLS]', '').replace('[SEP]', ''))
         else:
-            print(f"Answer: {answer}\n")
-        answers.append(answer)
+            inputs = tokenizer.encode_plus(question, text, return_tensors="pt")
+            # Need to pop token type ids when using distilbert because this model does not 
+            # handle them, but the encoder still sets them for some reason. 
+            inputs.pop('token_type_ids', None)
+            input_ids = inputs["input_ids"].tolist()[0]
+            
+            text_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+            answer_start_scores, answer_end_scores = model(**inputs)
+    
+            # Get the most likely beginning of answer with the argmax of the score
+            answer_start = torch.topk(answer_start_scores, 2)[1].to(dtype=torch.long, device="cuda")[0]
+            # Get the most likely end of answer with the argmax of the score
+            answer_end = torch.topk(answer_end_scores, 2)[1].to(dtype=torch.long, device="cuda")[0]
+
+            answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids[answer_start[0]:answer_end[0]+1]))
+            
+            if answer == '[CLS]':
+                answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids[answer_start[1]:answer_end[1]+1]))
+            answers.append(answer.replace('[CLS]', '').replace('[SEP]', ''))
+            
     return answers
 
     
-def pred(qdf, storiesDir, model, predOutDir, num_best_pars=1):
+def pred(qdf, storiesDir, model, predOutDir, num_best_pars=1, summaries=False):
     '''
     Given a narrativeqa dataframe, a directory where the narrative 
     stories are located, and a pytorch model, this function asks the questions 
@@ -113,22 +148,39 @@ def pred(qdf, storiesDir, model, predOutDir, num_best_pars=1):
     model = AutoModelForQuestionAnswering.from_pretrained(modelPath)
     
     docIds = qdf['document_id'].unique()
+
+    if summaries:
+        summarydf = pd.read_csv(os.path.join(storiesDir, "summaries.csv"))
+        
     for docId in docIds:
         docEntries = qdf.loc[qdf['document_id'] == docId]
-        docFile = os.path.join(storiesDir, docId + ".content")
-        with open(docFile, "r") as doc:
-            try:
-                data = doc.read()
-                if '<html>' not in data:
-                    data = strip_headers(data)
-                    pars = data.split("\n\n")
-                    BMScorer = B25mScorer(pars)
-                    docEntries["best_ranked_pars"] = docEntries["question"].apply(lambda q : BMScorer.get_best_n_doc_idxs(q, num_best_pars))
-                    docEntries['predicted_answers'] = docEntries[["question", "best_ranked_pars"]].apply(lambda x : answer_question(*x, pars), axis=1)
+        if not summaries:
+            docFile = os.path.join(storiesDir, docId + ".content")
+            with open(docFile, "r") as doc:
+                try:
+                    data = doc.read()
+                    if '<html>' not in data:
+                        data = strip_headers(data)
+                        pars = data.split("\n\n")
+                        BMScorer = B25mScorer(pars)
+                        docEntries["best_ranked_pars"] = docEntries["question"].apply(lambda q : BMScorer.get_best_n_doc_idxs(q, num_best_pars))
+                        docEntries['predicted_answers'] = docEntries[["question", "best_ranked_pars"]].apply(lambda x : answer_question(*x, pars), axis=1)
 
-                    docEntries.to_csv(os.path.join(predOutDir, docId + '.csv'), index=False)
+                        docEntries.to_csv(os.path.join(predOutDir, docId + '.csv'), index=False)
+                except UnicodeDecodeError:
+                    pass
+        else:
+            try:
+                data = summarydf["summary"].loc[summarydf['document_id'] == docId].item()
+                pars = data.split("\n") #re.split("\.\s|\?\s|\!\s", data)
+                BMScorer = B25mScorer(pars)
+                docEntries["best_ranked_pars"] = docEntries["question"].apply(lambda q : BMScorer.get_best_n_doc_idxs(q, num_best_pars))
+                docEntries['predicted_answers'] = docEntries[["question", "best_ranked_pars"]].apply(lambda x : answer_question(*x, pars), axis=1)
+
+                docEntries.to_csv(os.path.join(predOutDir, docId + '.csv'), index=False)
             except UnicodeDecodeError:
                 pass
+            
 
 
 def narrative_df_to_squadlike_txt(df, outName):
@@ -145,6 +197,7 @@ if __name__ == "__main__":
     # Define file and directory paths:
     qcsv = '../data/narrativeqa/qaps.csv'
     storiesDir = '../data/narrativeqa/stories'
+    summariesDir = '../data/narrativeqa/summaries'
     modelPath = "../models/SQuAD2_trained_model"
 
     tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased-distilled-squad")
@@ -161,6 +214,7 @@ if __name__ == "__main__":
 
 
     predOutDir = '../data/predictions/'
-    pred(qsTrain, storiesDir, modelPath, predOutDir, 4)
+    #pred(qsTrain, storiesDir, modelPath, predOutDir, 4)
+    pred(qsTrain, summariesDir, modelPath, predOutDir, 4, summaries=True)
 
 
