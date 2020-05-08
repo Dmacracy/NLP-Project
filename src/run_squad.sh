@@ -3,7 +3,6 @@ export SQUAD_DIR=../data/SQuAD/
 python3 run_squad.py \
   --model_type distilbert \
   --model_name_or_path distilbert-base-uncased-distilled-squad \
-  --do_train \
   --do_eval \
   --train_file $SQUAD_DIR/SQuAD-v1.1-train.json \
   --predict_file $SQUAD_DIR/SQuAD-v1.1-dev.json \

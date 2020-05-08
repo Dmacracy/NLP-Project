@@ -6,9 +6,13 @@ import numpy as np
 import scipy.sparse as sp
 from ast import literal_eval
 
+from collections import Counter
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+
 from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 
 import argparse
@@ -32,34 +36,89 @@ def split_train_test_val(qcsv):
     qsTest = qs.loc[qs['set'] == 'test']
     return qsTrain, qsVal, qsTest
 
+
+def read_embeddings(filename, vocab_size=10000):
+    """
+    Utility function, loads in the `vocab_size` most common embeddings from `filename`
+  
+    Arguments:
+    - filename:     path to file
+                    automatically infers correct embedding dimension from filename
+    - vocab_size:   maximum number of embeddings to load
+    
+    Returns 
+    - embeddings:   torch.FloatTensor matrix of size (vocab_size x word_embedding_dim)
+    - vocab:        dictionary mapping word (str) to index (int) in embedding matrix
+    """
+
+    PAD_INDEX = 0             # reserved for padding words
+    UNKNOWN_INDEX = 1         # reserved for unknown words
+
+    # get the embedding size from the first embedding
+    with open(filename, encoding="utf-8") as file:
+        word_embedding_dim = len(file.readline().split(" ")) - 1
+
+    vocab = {}
+    vocab["PAD_INDEX"] = PAD_INDEX
+    vocab["UNKNOWN_INDEX"] = UNKNOWN_INDEX
+  
+    embeddings = np.zeros((vocab_size, word_embedding_dim))
+
+    with open(filename, encoding="utf-8") as file:
+        for idx, line in enumerate(file):
+            if idx + 2 >= vocab_size:
+                break
+
+            cols = line.rstrip().split(" ")
+            val = np.array(cols[1:])
+            word = cols[0]
+            embeddings[idx + 2] = val
+            vocab[word] = idx + 2
+  
+    # a FloatTensor is a multidimensional matrix
+    # that contains 32-bit floats in every entry
+    # https://pytorch.org/docs/stable/tensors.html
+    return torch.FloatTensor(embeddings), vocab
+
 class B25mScorer:
     '''
     A B25m document retreival scorer.
     See https://en.wikipedia.org/wiki/Okapi_BM25
     '''
-    def __init__(self, docs, k=1.6, b=0.75):
+    def __init__(self, docs, k=1.6, b=0.75, n=1):
         self.N = len(docs) # num docs
         self.Ds = np.array([len(d) for d in docs]) # length of each doc
         self.avgD = np.mean(self.Ds) # avg doc length
         self.docs = [tokenizer.tokenize(doc) for doc in docs] # tokenized docs
         self.k = k # k and b params.
         self.b = b
+        self.n = n
+        self.docsDict = {}
+        self.fill_docs_dict()
+
+    def fill_docs_dict(self):
+        for i, doc in enumerate(self.docs):
+            self.docsDict[i] = Counter()
+            for j, tok in enumerate(doc):
+                if j + self.n < len(doc):
+                    self.docsDict[i][" ".join(doc[j:j+self.n])] += 1
 
     def score(self, q):
         # for a given query, return a list of scores for each doc
         scores = []
         q_tokenized = tokenizer.tokenize(q)
-        for idx, doc in enumerate(self.docs):   
+        for i in range(len(self.docs)):   
             score = 0
-            for q_tok in q_tokenized:
+            for j, q_tok in enumerate(q_tokenized):
+                q_tok_n_gram = " ".join(q_tokenized[j:j+self.n])
                 # number of docs containing q token:
-                n_q = np.sum([int(q_tok in d) for d in self.docs])
+                n_q = np.sum([int(q_tok_n_gram in self.docsDict[k]) for k in range(len(self.docs))])
                 # inverse doc freq for q word in this doc:
                 idf = np.log((self.N - n_q + 0.5) / (n_q + 0.5))
                 # term freq:
-                tf = doc.count(q_tok) / self.Ds[idx]
+                tf = self.docsDict[i][q_tok_n_gram] / self.Ds[i]
                 numerator = tf * (self.k + 1)
-                denominator = tf + self.k * (1 - self.b + (self.b * self.Ds[idx] /  self.avgD))
+                denominator = tf + self.k * (1 - self.b + (self.b * self.Ds[i] /  self.avgD))
                 # sum the doc's score over all query tokens
                 score += idf * (numerator / denominator)
             # add doc's score to list:
@@ -173,7 +232,7 @@ def pred(qdf, storiesDir, model, predOutDir, num_best_pars=1, summaries=False):
             try:
                 data = summarydf["summary"].loc[summarydf['document_id'] == docId].item()
                 pars = data.split("\n") #re.split("\.\s|\?\s|\!\s", data)
-                BMScorer = B25mScorer(pars)
+                BMScorer = B25mScorer(pars, n=2)
                 docEntries["best_ranked_pars"] = docEntries["question"].apply(lambda q : BMScorer.get_best_n_doc_idxs(q, num_best_pars))
                 docEntries['predicted_answers'] = docEntries[["question", "best_ranked_pars"]].apply(lambda x : answer_question(*x, pars), axis=1)
 
@@ -195,10 +254,13 @@ def narrative_df_to_squadlike_txt(df, outName):
 
 if __name__ == "__main__":
     # Define file and directory paths:
-    qcsv = '../data/narrativeqa/qaps.csv'
+    qcsv = '../data/narrativeqa/unitTesting/unitqaps.csv'
+    #qcsv = '../data/narrativeqa/qaps.csv'
     storiesDir = '../data/narrativeqa/stories'
-    summariesDir = '../data/narrativeqa/summaries'
-    modelPath = "../models/SQuAD2_trained_model"
+    #summariesDir = '../data/narrativeqa/summaries'
+    summariesDir = '../data/narrativeqa/unitTesting/summaries'
+    
+    modelPath = "../models/SQuAD_2_trained_fixed"
 
     tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased-distilled-squad")
     model = AutoModelForQuestionAnswering.from_pretrained(modelPath)
@@ -213,8 +275,12 @@ if __name__ == "__main__":
     #narrative_df_to_squadlike_txt(qsTest, './data/narrativeqa/test.txt')
 
 
-    predOutDir = '../data/predictions/'
+    predOutDir = '../data/predictions/unitTesting'
+    if not(os.path.exists(predOutDir)):
+        os.makedirs(predOutDir)
     #pred(qsTrain, storiesDir, modelPath, predOutDir, 4)
-    pred(qsTrain, summariesDir, modelPath, predOutDir, 4, summaries=True)
+    #pred(qsTrain, summariesDir, modelPath, predOutDir, 4, summaries=True)
+    #pred(qsVal, summariesDir, modelPath, predOutDir, 4, summaries=True)
+    pred(qsTest, summariesDir, modelPath, predOutDir, 4, summaries=True)
 
 
